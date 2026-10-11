@@ -2,8 +2,15 @@
 import torch
 
 from . import _C  # noqa: F401
-from . import _moe_C  # noqa: F401
 from . import _xpu_C  # noqa: F401
+
+# _moe_C exists only when the kernels were built with MOE_KERNELS_ENABLED. vLLM
+# imports this module for every model (fused_moe -> xpu_moe -> here), so a
+# missing _moe_C must not fail the import; the MoE ops below raise at use.
+try:
+    from . import _moe_C  # noqa: F401
+except ImportError:
+    _moe_C = None
 
 finfo = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3_MIN = finfo.min

@@ -17,6 +17,12 @@
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
+#ifdef _WIN32
+// ssize_t is POSIX and does not exist on MSVC; Python.h (included above)
+// defines Py_ssize_t with the same meaning on every platform.
+typedef Py_ssize_t ssize_t;
+#endif
+
 extern "C" {
 
 // Error handling

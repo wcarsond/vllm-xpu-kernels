@@ -4,6 +4,7 @@ import importlib.util
 import json
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -69,6 +70,9 @@ def get_oneapi_version() -> Version:
     print(icpx_output)
     print("=============== icpx version ===============")
     # output = icpx_output.split()
+
+
+IS_WINDOWS = platform.system() == "Windows"
 
 
 def _build_custom_ops() -> bool:
@@ -175,12 +179,21 @@ class cmake_build_ext(build_ext):
             ]
 
         # Pass the python executable to cmake so it can find an exact
-        # match.
-        cmake_args += ['-DVLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
+        # match. Windows: CMake reads backslashes as escapes ("Invalid
+        # character escape '\U'" from file(REAL_PATH ...)), so use forward
+        # slashes, as SystemPanic/vllm-windows does in vLLM's own setup.py.
+        python_exec_path = sys.executable
+        if IS_WINDOWS:
+            python_exec_path = python_exec_path.replace('\\', '/')
+        cmake_args += ['-DVLLM_PYTHON_EXECUTABLE={}'.format(python_exec_path)]
 
         # Pass the python path to cmake so it can reuse the build dependencies
         # on subsequent calls to python.
-        cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
+        if IS_WINDOWS:
+            py_path = ":".join(p.replace('\\', '/') for p in sys.path)
+        else:
+            py_path = ":".join(sys.path)
+        cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(py_path)]
 
         # Forward kernel build options to cmake so option() defaults are
         # overridden when the user sets environment variables.
@@ -244,15 +257,22 @@ class cmake_build_ext(build_ext):
             # Default build tool to whatever cmake picks.
             build_tool = []
         my_env = os.environ.copy()
-        icx_path = shutil.which('icx')
-        icpx_path = shutil.which('icpx')
-        build_option_gpu = {
-            "CMAKE_C_COMPILER": f"{icx_path}",
-            "CMAKE_CXX_COMPILER": f"{icpx_path}",
-        }
-        for key, value in build_option_gpu.items():
-            if value is not None:
-                cmake_args.append("-D{}={}".format(key, value))
+        # Windows: cmake/toolchain.cmake chooses the compiler (icx.exe: CMake's
+        # Platform/Windows-IntelLLVM drives every IntelLLVM compiler with
+        # MSVC-style flags, which the GNU-command-line icpx rejects). Passing
+        # -DCMAKE_CXX_COMPILER here as well made CMake see a "changed" compiler
+        # (which() returns icx.EXE, the toolchain says icx.exe), wipe its cache
+        # and re-run configure with none of these arguments.
+        if not IS_WINDOWS:
+            icx_path = shutil.which('icx')
+            icpx_path = shutil.which('icpx')
+            build_option_gpu = {
+                "CMAKE_C_COMPILER": f"{icx_path}",
+                "CMAKE_CXX_COMPILER": f"{icpx_path}",
+            }
+            for key, value in build_option_gpu.items():
+                if value is not None:
+                    cmake_args.append("-D{}={}".format(key, value))
         subprocess.check_call(
             ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp,
@@ -349,15 +369,20 @@ class cmake_build_ext(build_ext):
         super().run()
 
         import glob
-        files = glob.glob(
-            os.path.join(self.build_lib, "vllm_xpu_kernels", "lib*.so"))
+        pkg_dir = os.path.join(self.build_lib, "vllm_xpu_kernels")
+        files = glob.glob(os.path.join(pkg_dir, "lib*.so"))
+        if IS_WINDOWS:
+            # Kernel libraries are <name>.dll here, no "lib" prefix, and they
+            # must sit beside the .pyd files: Python 3.8+ resolves an
+            # extension's dependent DLLs from its own directory, not PATH.
+            files += glob.glob(os.path.join(pkg_dir, "*.dll"))
         # if is editable install, also copy to local inplace directory
         if self.inplace:
             for file in files:
                 inplace_dst_file = os.path.join(
                     os.path.dirname(__file__),
                     "vllm_xpu_kernels",
-                    file.split("vllm_xpu_kernels/")[-1],
+                    os.path.basename(file),
                 )
                 print(f"Copying {file} to {inplace_dst_file}")
                 self.copy_file(file, inplace_dst_file)

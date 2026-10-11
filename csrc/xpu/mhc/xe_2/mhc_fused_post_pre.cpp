@@ -34,14 +34,16 @@ static constexpr int DISPATCH_THRESHOLD = 128;
 
 // ---- extern declarations for launch functions (defined in sibling TUs) ----
 
-// from mhc_post.cpp
+// from mhc_post.cpp. The __restrict qualifiers must match the definition: the
+// MSVC ABI mangles __restrict on pointer parameters into the symbol name (the
+// Itanium ABI drops it), so without them the Windows link fails with LNK2019.
 extern void launch_mhc_post_opt(
     sycl::queue& q,
-    const float* comb_res_mix,
-    const bf16* residual,
-    const float* post_layer_mix,
-    const bf16* x,
-    bf16* out,
+    const float* __restrict comb_res_mix,
+    const bf16* __restrict residual,
+    const float* __restrict post_layer_mix,
+    const bf16* __restrict x,
+    bf16* __restrict out,
     int N,
     int H);
 

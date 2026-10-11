@@ -10,6 +10,11 @@
 #include "quantization/fp8/quant_utils.h"
 #include "dispatch_utils.h"
 
+#ifdef _WIN32
+// `uint` is a glibc <sys/types.h> extension, not C++; MSVC has no such name.
+typedef unsigned int uint;
+#endif
+
 namespace vllm {
 
 // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005

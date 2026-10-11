@@ -4,8 +4,14 @@
 import torch
 from typing import Optional
 import vllm_xpu_kernels._C  # noqa: F401
-import vllm_xpu_kernels._moe_C  # noqa: F401
 import vllm_xpu_kernels._xpu_C  # noqa: F401
+
+# _moe_C is absent when the kernels were built with MOE_KERNELS_ENABLED=OFF; the
+# non-MoE test modules must still collect. MoE tests then fail at the op call.
+try:
+    import vllm_xpu_kernels._moe_C  # noqa: F401
+except ImportError:
+    pass
 
 
 # layer norm ops

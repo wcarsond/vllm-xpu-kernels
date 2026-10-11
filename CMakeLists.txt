@@ -246,7 +246,21 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # TODO: check SYCL flags
   set(CMAKE_${VLLM_GPU_LANG}_FLAGS "${CMAKE_${VLLM_GPU_LANG}_FLAGS}")
   set(SYCL_FIRST_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/csrc/sycl_first.h")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include ${SYCL_FIRST_HEADER}")
+  if(WIN32)
+    # MSVC-style driver: "-include" is not an option there, so the header path
+    # became a second input file ("cannot specify -Fo when compiling multiple
+    # source files"). /FI is the MSVC forced include.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FI${SYCL_FIRST_HEADER}")
+    # MSVC's math.h defines M_SQRT2 and friends (activation.cpp) only under
+    # _USE_MATH_DEFINES, and it must be set before the first <cmath>, which the
+    # forced include above pulls in; so it is a compile definition, not a
+    # #define in the file. Set on that one source only: a global definition
+    # changes every compile command and makes ninja rebuild everything.
+    set_source_files_properties(csrc/activation.cpp PROPERTIES
+                                COMPILE_DEFINITIONS _USE_MATH_DEFINES)
+  else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include ${SYCL_FIRST_HEADER}")
+  endif()
 
   # AOT devices can be overridden via environment variables:
   # VLLM_XPU_AOT_DEVICES and VLLM_XPU_XE2_AOT_DEVICES Example: export
@@ -281,7 +295,12 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
 
   list(APPEND SYCL_FLAGS "-fsycl")
   # For l0 ops like getMemoryInfo
-  list(APPEND SYCL_FLAGS "-lze_loader")
+  if(NOT WIN32)
+    list(APPEND SYCL_FLAGS "-lze_loader")
+  endif()
+  # Windows: the MSVC-style driver reads "-lze_loader" as a second input file
+  # ("cannot specify -Fo when compiling multiple source files"); ze_loader is
+  # linked as a library below (VLLM_XPU_LINK_LIBRARIES) from LEVEL_ZERO_ROOT.
   list(APPEND SYCL_FLAGS "-Wno-unused-command-line-argument")
 
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
@@ -298,7 +317,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   set(SYCL_LINK_FLAGS "")
   list(APPEND SYCL_LINK_FLAGS "-fsycl")
   # For l0 ops like getMemoryInfo
-  list(APPEND SYCL_LINK_FLAGS "-lze_loader")
+  if(NOT WIN32)
+    list(APPEND SYCL_LINK_FLAGS "-lze_loader")
+  endif()
   list(APPEND SYCL_LINK_FLAGS "-Wno-unused-command-line-argument")
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_LINK_FLAGS})
   set(SYCL_DEVICE_LINK_FLAGS
@@ -528,6 +549,31 @@ list(APPEND VLLM_XPU_INCLUDE_DIR ${CMPLR_ROOT}/include/syclcompat/)
 message(STATUS "VLLM_XPU_INCLUDE_DIR: ${VLLM_XPU_INCLUDE_DIR}")
 
 set(VLLM_XPU_LINK_LIBRARIES "")
+if(WIN32)
+  # No pthread/m/dl on Windows. Neither oneAPI nor the torch wheel ships
+  # ze_loader.lib or level_zero/ze_api.h on Windows (the graphics driver installs
+  # only ze_loader.dll); LEVEL_ZERO_ROOT points at the Level Zero Windows SDK
+  # (lib/ze_loader.lib, include/) of the same version as the installed loader.
+  set(LEVEL_ZERO_ROOT $ENV{LEVEL_ZERO_ROOT})
+  if(NOT LEVEL_ZERO_ROOT)
+    message(FATAL_ERROR "LEVEL_ZERO_ROOT is not set (needs lib/ze_loader.lib)")
+  endif()
+  find_library(ZE_LOADER_LIBRARY NAMES ze_loader PATHS "${LEVEL_ZERO_ROOT}/lib" NO_DEFAULT_PATH)
+  if(NOT ZE_LOADER_LIBRARY)
+    message(FATAL_ERROR "ze_loader.lib not found under ${LEVEL_ZERO_ROOT}/lib")
+  endif()
+  message(STATUS "ze_loader import library: ${ZE_LOADER_LIBRARY}")
+  if(EXISTS "${LEVEL_ZERO_ROOT}/include")
+    include_directories("${LEVEL_ZERO_ROOT}/include")
+  endif()
+  list(
+    APPEND
+    VLLM_XPU_LINK_LIBRARIES
+    "sycl"
+    "OpenCL"
+    "${ZE_LOADER_LIBRARY}"
+    "torch")
+else()
 list(
   APPEND
   VLLM_XPU_LINK_LIBRARIES
@@ -537,6 +583,7 @@ list(
   "m"
   "dl"
   "torch")
+endif()
 
 #
 # xpumem_allocator extension - XPU memory allocator with Python callbacks
@@ -569,6 +616,15 @@ if(XPUMEM_ALLOCATOR_ENABLED)
                                                       ${PYTORCH_INCLUDES} csrc)
 
   target_link_libraries(xpumem_allocator PRIVATE torch ${TORCH_LIBRARIES})
+  if(WIN32)
+    # Py_LIMITED_API is removed above, so this module uses the full Python ABI.
+    # On Windows pyconfig.h then asks the linker for python3XX.lib by #pragma,
+    # which python_add_library's stable-ABI link (python3.lib) does not provide.
+    # Python::Module supplies the versioned library with its directory. This
+    # one module is therefore version-specific (cp310 here); the kernel modules
+    # keep USE_SABI and stay abi3.
+    target_link_libraries(xpumem_allocator PRIVATE Python::Module)
+  endif()
 
   if(VLLM_GPU_LANG STREQUAL "SYCL")
     target_link_options(xpumem_allocator PRIVATE ${VLLM_GPU_LINK_FLAGS})

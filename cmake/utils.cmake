@@ -524,6 +524,13 @@ function(define_gpu_extension_target GPU_MOD_NAME)
 
   if(GPU_LANGUAGE STREQUAL "SYCL")
     target_link_options(${GPU_MOD_NAME} PRIVATE ${GPU_LINK_FLAGS})
+    if(WIN32 AND ZE_LOADER_LIBRARY)
+      # On Linux the Level Zero loader arrives through the "-lze_loader" link
+      # flag; the MSVC-style driver has no "-l", so link the import library
+      # found from LEVEL_ZERO_ROOT (top-level CMakeLists) explicitly. Needed by
+      # csrc/utils/mem_info.cpp (zeDeviceGetMemoryProperties and friends).
+      target_link_libraries(${GPU_MOD_NAME} PRIVATE ${ZE_LOADER_LIBRARY})
+    endif()
   endif()
 
   # Don't use `TORCH_LIBRARIES` for CUDA since it pulls in a bunch of
@@ -564,6 +571,12 @@ function(add_xe2_kernel_library LIBRARY_NAME)
 
   # Create static library
   add_library(${LIBRARY_NAME} SHARED ${KERNEL_SOURCES})
+  if(WIN32)
+    # A Linux .so exports every symbol; a Windows DLL exports none unless told
+    # to, so the extension modules that call into this library (attn_interface,
+    # the mhc ops) found an empty import library. CMake writes the .def.
+    set_target_properties(${LIBRARY_NAME} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  endif()
 
   # Set include directories
   target_include_directories(
@@ -594,8 +607,14 @@ function(add_xe2_kernel_library LIBRARY_NAME)
       "Setting library output directory for target '${LIBRARY_NAME}' to '${CMAKE_BINARY_DIR}/'."
   )
   set_target_properties(${LIBRARY_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                   "${CMAKE_BINARY_DIR}/"
+                                                   RUNTIME_OUTPUT_DIRECTORY
                                                    "${CMAKE_BINARY_DIR}/")
+  # On Windows a shared library's .dll is the RUNTIME artifact (the LIBRARY
+  # kind is only the import .lib), so without RUNTIME here the DLLs the
+  # extension modules load at import time never reach the package.
   install(TARGETS ${LIBRARY_NAME} LIBRARY DESTINATION ${ARG_DESTINATION}
+                                  RUNTIME DESTINATION ${ARG_DESTINATION}
                                           COMPONENT ${LIBRARY_NAME})
 
   # Set link options for XE2 devices
@@ -640,6 +659,12 @@ function(add_xe3_kernel_library LIBRARY_NAME)
 
   # Create shared library
   add_library(${LIBRARY_NAME} SHARED ${KERNEL_SOURCES})
+  if(WIN32)
+    # A Linux .so exports every symbol; a Windows DLL exports none unless told
+    # to, so the extension modules that call into this library (attn_interface,
+    # the mhc ops) found an empty import library. CMake writes the .def.
+    set_target_properties(${LIBRARY_NAME} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  endif()
 
   # Set include directories
   target_include_directories(
@@ -686,8 +711,14 @@ function(add_xe3_kernel_library LIBRARY_NAME)
       "Setting library output directory for target '${LIBRARY_NAME}' to '${CMAKE_BINARY_DIR}/'."
   )
   set_target_properties(${LIBRARY_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                   "${CMAKE_BINARY_DIR}/"
+                                                   RUNTIME_OUTPUT_DIRECTORY
                                                    "${CMAKE_BINARY_DIR}/")
+  # On Windows a shared library's .dll is the RUNTIME artifact (the LIBRARY
+  # kind is only the import .lib), so without RUNTIME here the DLLs the
+  # extension modules load at import time never reach the package.
   install(TARGETS ${LIBRARY_NAME} LIBRARY DESTINATION ${ARG_DESTINATION}
+                                  RUNTIME DESTINATION ${ARG_DESTINATION}
                                           COMPONENT ${LIBRARY_NAME})
 
   # Set link options for XE3 devices
@@ -735,6 +766,12 @@ function(add_xe_default_kernel_library LIBRARY_NAME)
 
   # Create static library
   add_library(${LIBRARY_NAME} SHARED ${KERNEL_SOURCES})
+  if(WIN32)
+    # A Linux .so exports every symbol; a Windows DLL exports none unless told
+    # to, so the extension modules that call into this library (attn_interface,
+    # the mhc ops) found an empty import library. CMake writes the .def.
+    set_target_properties(${LIBRARY_NAME} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  endif()
 
   # Set include directories
   target_include_directories(
@@ -760,8 +797,14 @@ function(add_xe_default_kernel_library LIBRARY_NAME)
   target_link_libraries(${LIBRARY_NAME} PRIVATE torch)
   target_link_libraries(${LIBRARY_NAME} PRIVATE ${TORCH_LIBRARIES})
   set_target_properties(${LIBRARY_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                   "${CMAKE_BINARY_DIR}/"
+                                                   RUNTIME_OUTPUT_DIRECTORY
                                                    "${CMAKE_BINARY_DIR}/")
+  # On Windows a shared library's .dll is the RUNTIME artifact (the LIBRARY
+  # kind is only the import .lib), so without RUNTIME here the DLLs the
+  # extension modules load at import time never reach the package.
   install(TARGETS ${LIBRARY_NAME} LIBRARY DESTINATION ${ARG_DESTINATION}
+                                  RUNTIME DESTINATION ${ARG_DESTINATION}
                                           COMPONENT ${LIBRARY_NAME})
 
   # Set link options for default devices (AOT_DEVICES instead of
