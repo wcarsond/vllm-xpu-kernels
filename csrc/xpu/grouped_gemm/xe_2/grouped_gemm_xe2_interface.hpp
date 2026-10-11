@@ -30,149 +30,23 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief CUTLASS Intel BMG MoE API example based on sycl-tla Group GEMM
+    \brief CUTLASS Intel BMG MoE API: argument checking and dispatch for the grouped GEMM.
 
+    This file no longer includes cutlass. It validates the tensors, works out the weight format
+    (the "family") and the tile policy, fills MoELaunchArgs and calls one of the launchers that the
+    translation units in split/ define (see grouped_gemm_xe2_launch.hpp). Each of those compiles one
+    or two kernels; the previous single-file form compiled all ~62 and needed over 30 GB.
 */
+#pragma once
+
+#include <ATen/xpu/XPUContext.h>
+#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
+
 #include "csrc/utils.h"
-
-#include <cute/tensor.hpp>
-#include <random>
-
-#include <cute/util/compat.hpp>
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-#include <sycl/sycl.hpp>
-
-#include <cute/tensor.hpp>
-
-#include "cutlass/kernel_hardware_info.h"
-#include "cutlass/platform/platform.h"
-#include "cutlass/tensor_ref.h"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/device_memory.h"
-#include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-
-#include "gemm_xe2_policy.hpp"
-#include "grouped_gemm_xe2.hpp"
-
-#pragma clang diagnostic ignored "-Wpass-failed"
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include "grouped_gemm_xe2_launch.hpp"
 
 namespace MoE {
-using namespace cute;
-
-// type tag to define a unique sycl kernel name
-template <
-    typename,
-    typename,
-    typename,
-    typename,
-    char,
-    char,
-    class,
-    A_DTYPE,
-    B_DTYPE>
-class GemmCuteName;
-
-template <
-    char layoutA,
-    char layoutB,
-    class policy,
-    A_DTYPE TENSOR_A_DTYPE,
-    B_DTYPE TENSOR_B_DTYPE,
-    typename ElementA,
-    typename ElementB,
-    typename ElementS,
-    typename ElementBI,
-    typename ElementD>
-void MoEGEMMLauncher(
-    sycl::queue& stream,
-    const ElementA* activations,
-    const ElementB* weights,
-    const ElementS* scales,
-    const ElementBI* bias,
-    ElementD* outputs,
-    const int gemm_n,
-    const int gemm_k,
-    const int* rows_per_expert,
-    const int num_experts,
-    const int group_size,
-    int32_t* atomic_buffer) {
-  using ElementA_non_CV = cutlass::platform::remove_cv_t<ElementA>;
-  auto op = XE_DPAS_TT<8, float, ElementA_non_CV>{};
-
-  using WGTile = typename policy::WGTile;
-  using SGLayout = typename policy::SGLayout;
-  using MMA = typename TiledMMAHelper<
-      MMA_Atom<decltype(op)>,
-      Layout<WGTile>,
-      SGLayout>::TiledMMA;
-  auto mma = MMA{};
-
-  int sm_count =
-      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  auto MaxThreadsPerWorkgroup = size(mma);
-
-  static constexpr int MaxThreadsPerSM = 512;
-
-  TORCH_CHECK(
-      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0,
-      "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup")
-
-  sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
-  sycl::range<3> global(
-      1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);
-
-  namespace syclex = sycl::ext::oneapi::experimental;
-  namespace intelex = sycl::ext::intel::experimental;
-
-  syclex::properties kernel_props{
-      syclex::sub_group_size<16>, intelex::grf_size<256>};
-
-  using GmemTiledCopyA = typename policy::GmemTiledCopyA;
-  using GmemTiledCopyB = typename policy::GmemTiledCopyB;
-  using GmemTiledCopyD = typename policy::GmemTiledCopyD;
-
-  stream.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
-    cgh.parallel_for<GemmCuteName<
-        ElementA,
-        ElementB,
-        ElementS,
-        ElementD,
-        layoutA,
-        layoutB,
-        policy,
-        TENSOR_A_DTYPE,
-        TENSOR_B_DTYPE>>(
-        sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-          MoE::MoEGEMM<
-              TENSOR_A_DTYPE,
-              TENSOR_B_DTYPE,
-              GmemTiledCopyA,
-              GmemTiledCopyB,
-              GmemTiledCopyD,
-              layoutA,
-              layoutB,
-              'R'>(
-              activations,
-              weights,
-              scales,
-              bias,
-              outputs,
-              mma,
-              rows_per_expert,
-              num_experts,
-              group_size,
-              gemm_n,
-              gemm_k,
-              atomic_buffer,
-              local_mem);
-        });
-  });
-}
 
 at::Tensor cutlass_grouped_gemm_xe2_impl(
     at::Tensor& ptr_A,
@@ -249,37 +123,38 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     TORCH_CHECK(ptr_bias->size(1) == N, "ptr_bias.size(1) must match N");
   }
 
+  TORCH_CHECK(
+      A_dtype == at::kBFloat16 || A_dtype == at::kHalf,
+      "grouped gemm activations must be bfloat16 or float16");
+  const bool a_bf16 = (A_dtype == at::kBFloat16);
+
   // Must be zeroed before kernel launch. Workgroup execution order
   // is non-deterministic, so initializing in the definition is the most
   // safe place to avoid any race condition as well as garbage data
   at::Tensor atomic_buffer =
       at::zeros({static_cast<long>(1)}, ptr_A.options().dtype(at::kInt));
 
-#define MoEGEMMLauncherCallER(                                                 \
-    LayoutA,                                                                   \
-    LayoutB,                                                                   \
-    Policy,                                                                    \
-    TENSOR_A_DTYPE,                                                            \
-    TENSOR_B_DTYPE,                                                            \
-    ElementA,                                                                  \
-    ElementB,                                                                  \
-    ElementS)                                                                  \
-  MoEGEMMLauncher<LayoutA, LayoutB, Policy, TENSOR_A_DTYPE, TENSOR_B_DTYPE>(   \
-      dpcpp_queue,                                                             \
-      reinterpret_cast<ElementA*>(ptr_A.data_ptr()),                           \
-      reinterpret_cast<ElementB*>(ptr_B.data_ptr()),                           \
-      ptr_scales.has_value()                                                   \
-          ? reinterpret_cast<ElementS*>(ptr_scales->data_ptr())                \
-          : static_cast<ElementS*>(nullptr),                                   \
-      ptr_bias.has_value() ? reinterpret_cast<ElementA*>(ptr_bias->data_ptr()) \
-                           : static_cast<ElementA*>(nullptr),                  \
-      reinterpret_cast<ElementA*>(ptr_D.data_ptr()),                           \
-      N,                                                                       \
-      K,                                                                       \
-      reinterpret_cast<int*>(rows_per_expert.data_ptr()),                      \
-      num_experts,                                                             \
-      group_size,                                                              \
-      static_cast<int*>(atomic_buffer.data_ptr()));
+  MoELaunchArgs a{};
+  a.queue = &dpcpp_queue;
+  a.A = ptr_A.data_ptr();
+  a.B = ptr_B.data_ptr();
+  a.scales = nullptr;
+  a.bias = ptr_bias.has_value() ? ptr_bias->data_ptr() : nullptr;
+  a.D = ptr_D.data_ptr();
+  a.N = static_cast<int>(N);
+  a.K = static_cast<int>(K);
+  a.rows_per_expert = static_cast<const int*>(rows_per_expert.data_ptr());
+  a.num_experts = static_cast<int>(num_experts);
+  a.atomic_buffer = static_cast<int32_t*>(atomic_buffer.data_ptr());
+  a.A_dtype = ptr_A.scalar_type();
+  a.B_dtype = ptr_B.scalar_type();
+  a.is_int4 = is_B_int4;
+  a.is_mxfp4 = is_B_mxfp4;
+
+  MoEFamily family;
+  int policy;
+  // Keeps a host-side rearranged scale tensor alive until the kernel has been submitted.
+  at::Tensor scales_keep;
 
   if (is_B_int4 || is_B_mxfp4) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
@@ -302,72 +177,9 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
         group_size == 32 || group_size == 64 || group_size == 128 ||
             group_size == 256,
         "group_size must be 32, 64, 128 or 256");
-
-#define W4A16LauncherCallER(policy)    \
-  if (is_B_int4) {                     \
-    if (A_dtype == at::kBFloat16) {    \
-      using scalar_t = bfloat16_t;     \
-      MoEGEMMLauncherCallER(           \
-          'R',                         \
-          'C',                         \
-          policy,                      \
-          A_DTYPE::BITS16,             \
-          B_DTYPE::INT4,               \
-          scalar_t,                    \
-          uint8_t,                     \
-          scalar_t);                   \
-    } else if (A_dtype == at::kHalf) { \
-      using scalar_t = half_t;         \
-      MoEGEMMLauncherCallER(           \
-          'R',                         \
-          'C',                         \
-          policy,                      \
-          A_DTYPE::BITS16,             \
-          B_DTYPE::INT4,               \
-          scalar_t,                    \
-          uint8_t,                     \
-          scalar_t);                   \
-    }                                  \
-  } else if (is_B_mxfp4) {             \
-    if (A_dtype == at::kBFloat16) {    \
-      using scalar_t = bfloat16_t;     \
-      MoEGEMMLauncherCallER(           \
-          'R',                         \
-          'C',                         \
-          policy,                      \
-          A_DTYPE::BITS16,             \
-          B_DTYPE::MXFP4,              \
-          scalar_t,                    \
-          uint8_t,                     \
-          uint8_t);                    \
-    } else if (A_dtype == at::kHalf) { \
-      using scalar_t = half_t;         \
-      MoEGEMMLauncherCallER(           \
-          'R',                         \
-          'C',                         \
-          policy,                      \
-          A_DTYPE::BITS16,             \
-          B_DTYPE::MXFP4,              \
-          scalar_t,                    \
-          uint8_t,                     \
-          uint8_t);                    \
-    }                                  \
-  }
-
-    if (A_avg_M <= 4) {
-      using policy = w4a16_policy_m_8;
-      W4A16LauncherCallER(policy);
-    } else if (A_avg_M <= 8) {
-      using policy = w4a16_policy_m_16;
-      W4A16LauncherCallER(policy);
-    } else if (A_avg_M <= 128) {
-      using policy = w4a16_policy_m_32;
-      W4A16LauncherCallER(policy);
-    } else {
-      using policy = w4a16_policy;
-      W4A16LauncherCallER(policy);
-    }
-#undef W4A16LauncherCallER
+    a.scales = ptr_scales->data_ptr();
+    family = MoEFamily::W4A16;
+    policy = (A_avg_M <= 4) ? 0 : (A_avg_M <= 8) ? 1 : (A_avg_M <= 128) ? 2 : 3;
   } else if (is_B_mxfp8) {
     TORCH_CHECK(ptr_scales.has_value(), "mxfp8 grouped gemm must have scales");
     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
@@ -382,148 +194,29 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
 
     // Canonical kernel layout is [E, N, K/32] (same indexing as mxfp4 E8M0).
     // Accept [E, K/32, N] from moe_utils / vLLM and transpose once on host.
-    at::Tensor scales_nk = *ptr_scales;
-    if (scales_nk.scalar_type() == at::kFloat8_e8m0fnu) {
-      scales_nk = scales_nk.view(at::kByte);
+    scales_keep = *ptr_scales;
+    if (scales_keep.scalar_type() == at::kFloat8_e8m0fnu) {
+      scales_keep = scales_keep.view(at::kByte);
     }
-    if (scales_nk.size(1) == (K / 32) && scales_nk.size(2) == N) {
-      scales_nk = scales_nk.transpose(1, 2).contiguous();
+    if (scales_keep.size(1) == (K / 32) && scales_keep.size(2) == N) {
+      scales_keep = scales_keep.transpose(1, 2).contiguous();
     }
     TORCH_CHECK(
-        scales_nk.size(1) == N && scales_nk.size(2) == (K / 32),
+        scales_keep.size(1) == N && scales_keep.size(2) == (K / 32),
         "mxfp8 scales must be [E, N, K/32] after layout normalize; got [",
-        scales_nk.size(0),
+        scales_keep.size(0),
         ", ",
-        scales_nk.size(1),
+        scales_keep.size(1),
         ", ",
-        scales_nk.size(2),
+        scales_keep.size(2),
         "] with N=",
         N,
         " K=",
         K);
     group_size = 32;
-
-    // Rebind ptr_scales for the launcher macro below.
-    // MoEGEMMLauncherCallER reads ptr_scales->data_ptr().
-    c10::optional<at::Tensor> scales_opt = scales_nk;
-    const c10::optional<at::Tensor>& ptr_scales_mx = scales_opt;
-#undef MoEGEMMLauncherCallER
-#define MoEGEMMLauncherCallER(                                                 \
-    LayoutA,                                                                   \
-    LayoutB,                                                                   \
-    Policy,                                                                    \
-    TENSOR_A_DTYPE,                                                            \
-    TENSOR_B_DTYPE,                                                            \
-    ElementA,                                                                  \
-    ElementB,                                                                  \
-    ElementS)                                                                  \
-  MoEGEMMLauncher<LayoutA, LayoutB, Policy, TENSOR_A_DTYPE, TENSOR_B_DTYPE>(   \
-      dpcpp_queue,                                                             \
-      reinterpret_cast<ElementA*>(ptr_A.data_ptr()),                           \
-      reinterpret_cast<ElementB*>(ptr_B.data_ptr()),                           \
-      ptr_scales_mx.has_value()                                                \
-          ? reinterpret_cast<ElementS*>(ptr_scales_mx->data_ptr())             \
-          : static_cast<ElementS*>(nullptr),                                   \
-      ptr_bias.has_value() ? reinterpret_cast<ElementA*>(ptr_bias->data_ptr()) \
-                           : static_cast<ElementA*>(nullptr),                  \
-      reinterpret_cast<ElementA*>(ptr_D.data_ptr()),                           \
-      N,                                                                       \
-      K,                                                                       \
-      reinterpret_cast<int*>(rows_per_expert.data_ptr()),                      \
-      num_experts,                                                             \
-      group_size,                                                              \
-      static_cast<int*>(atomic_buffer.data_ptr()));
-
-#define W8MXFP8LauncherCallER(policy)                                     \
-  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {            \
-    using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::MXFP8,                                                   \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        uint8_t);                                                         \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {       \
-    using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::MXFP8,                                                   \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        uint8_t);                                                         \
-  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) { \
-    using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::MXFP8,                                                   \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        uint8_t);                                                         \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {   \
-    using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::MXFP8,                                                   \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        uint8_t);                                                         \
-  } else {                                                                \
-    TORCH_CHECK(                                                          \
-        false,                                                            \
-        "mxfp8 grouped gemm requires A in {fp16,bf16} and B in "          \
-        "{float8_e4m3fn, float8_e5m2}");                                  \
-  }
-
-    if (A_avg_M <= 8) {
-      using policy = w8a16_policy_m_16;
-      W8MXFP8LauncherCallER(policy);
-    } else if (A_avg_M <= 32) {
-      using policy = w8a16_policy_m_32;
-      W8MXFP8LauncherCallER(policy);
-    } else {
-      using policy = w8a16_policy;
-      W8MXFP8LauncherCallER(policy);
-    }
-#undef W8MXFP8LauncherCallER
-// Restore the default launcher macro for subsequent branches.
-#undef MoEGEMMLauncherCallER
-#define MoEGEMMLauncherCallER(                                                 \
-    LayoutA,                                                                   \
-    LayoutB,                                                                   \
-    Policy,                                                                    \
-    TENSOR_A_DTYPE,                                                            \
-    TENSOR_B_DTYPE,                                                            \
-    ElementA,                                                                  \
-    ElementB,                                                                  \
-    ElementS)                                                                  \
-  MoEGEMMLauncher<LayoutA, LayoutB, Policy, TENSOR_A_DTYPE, TENSOR_B_DTYPE>(   \
-      dpcpp_queue,                                                             \
-      reinterpret_cast<ElementA*>(ptr_A.data_ptr()),                           \
-      reinterpret_cast<ElementB*>(ptr_B.data_ptr()),                           \
-      ptr_scales.has_value()                                                   \
-          ? reinterpret_cast<ElementS*>(ptr_scales->data_ptr())                \
-          : static_cast<ElementS*>(nullptr),                                   \
-      ptr_bias.has_value() ? reinterpret_cast<ElementA*>(ptr_bias->data_ptr()) \
-                           : static_cast<ElementA*>(nullptr),                  \
-      reinterpret_cast<ElementA*>(ptr_D.data_ptr()),                           \
-      N,                                                                       \
-      K,                                                                       \
-      reinterpret_cast<int*>(rows_per_expert.data_ptr()),                      \
-      num_experts,                                                             \
-      group_size,                                                              \
-      static_cast<int*>(atomic_buffer.data_ptr()));
+    a.scales = scales_keep.data_ptr();
+    family = MoEFamily::MXFP8;
+    policy = (A_avg_M <= 8) ? 0 : (A_avg_M <= 32) ? 1 : 2;
   } else if (is_B_block_fp8) {
     TORCH_CHECK(
         ptr_scales.has_value(), "block-fp8 grouped gemm must have scales");
@@ -551,70 +244,9 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     TORCH_CHECK(
         ptr_scales->dtype() == at::kFloat, "block-fp8 scales must be float32");
     group_size = 128;
-
-#define W8BLOCKFP8LauncherCallER(policy)                                  \
-  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {            \
-    using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        float);                                                           \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {       \
-    using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        float);                                                           \
-  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) { \
-    using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        float);                                                           \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {   \
-    using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::BLOCK_FP8,                                               \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        float);                                                           \
-  } else {                                                                \
-    TORCH_CHECK(                                                          \
-        false,                                                            \
-        "block-fp8 grouped gemm requires A in {fp16,bf16} and B in "      \
-        "{float8_e4m3fn, float8_e5m2}");                                  \
-  }
-
-    if (A_avg_M <= 8) {
-      using policy = w8a16_policy_m_16;
-      W8BLOCKFP8LauncherCallER(policy);
-    } else if (A_avg_M <= 32) {
-      using policy = w8a16_policy_m_32;
-      W8BLOCKFP8LauncherCallER(policy);
-    } else {
-      using policy = w8a16_policy;
-      W8BLOCKFP8LauncherCallER(policy);
-    }
-#undef W8BLOCKFP8LauncherCallER
+    a.scales = ptr_scales->data_ptr();
+    family = MoEFamily::BLOCK_FP8;
+    policy = (A_avg_M <= 8) ? 0 : (A_avg_M <= 32) ? 1 : 2;
   } else if (is_weight_fp8) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
@@ -624,115 +256,31 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
         ptr_scales->size(0) == num_experts,
         "ptr_scales.size(0) of fp8 must match num_experts");
     TORCH_CHECK(ptr_scales->dtype() == at::kFloat, "ptr_scales must be float");
-
-#define W8A16LauncherCallER(policy)                                       \
-  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {            \
-    using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::PER_TENSOR_FP8,                                          \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        float);                                                           \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {       \
-    using scalar_t = half_t;                                              \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::PER_TENSOR_FP8,                                          \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        float);                                                           \
-  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) { \
-    using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::PER_TENSOR_FP8,                                          \
-        scalar_t,                                                         \
-        float_e4m3_t,                                                     \
-        float);                                                           \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {   \
-    using scalar_t = bfloat16_t;                                          \
-    MoEGEMMLauncherCallER(                                                \
-        'R',                                                              \
-        'R',                                                              \
-        policy,                                                           \
-        A_DTYPE::BITS16,                                                  \
-        B_DTYPE::PER_TENSOR_FP8,                                          \
-        scalar_t,                                                         \
-        float_e5m2_t,                                                     \
-        float);                                                           \
-  }
-
-    if (A_avg_M <= 8) {
-      using policy = w8a16_policy_m_16;
-      W8A16LauncherCallER(policy);
-    } else if (A_avg_M <= 32) {
-      using policy = w8a16_policy_m_32;
-      W8A16LauncherCallER(policy);
-    } else {
-      using policy = w8a16_policy;
-      W8A16LauncherCallER(policy);
-    }
-#undef W8A16LauncherCallER
+    a.scales = ptr_scales->data_ptr();
+    family = MoEFamily::FP8;
+    policy = (A_avg_M <= 8) ? 0 : (A_avg_M <= 32) ? 1 : 2;
   } else {
     TORCH_CHECK(
         !ptr_scales.has_value(), "w16a16 grouped gemm must not have scales");
-
-#define W16A16LauncherCallER(policy) \
-  if (A_dtype == at::kBFloat16) {    \
-    using scalar_t = bfloat16_t;     \
-    MoEGEMMLauncherCallER(           \
-        'R',                         \
-        'R',                         \
-        policy,                      \
-        A_DTYPE::BITS16,             \
-        B_DTYPE::BITS16,             \
-        scalar_t,                    \
-        scalar_t,                    \
-        scalar_t);                   \
-  } else if (A_dtype == at::kHalf) { \
-    using scalar_t = half_t;         \
-    MoEGEMMLauncherCallER(           \
-        'R',                         \
-        'R',                         \
-        policy,                      \
-        A_DTYPE::BITS16,             \
-        B_DTYPE::BITS16,             \
-        scalar_t,                    \
-        scalar_t,                    \
-        scalar_t);                   \
-  }
-
+    TORCH_CHECK(
+        B_dtype == A_dtype,
+        "w16a16 grouped gemm: weights and activations must share a dtype");
+    family = MoEFamily::W16A16;
     if (A_avg_M <= 8) {
-      using policy = w16a16_policy_m_16;
-      W16A16LauncherCallER(policy);
+      policy = 0;  // m_16
     } else if (A_avg_M <= 16) {
-      using policy = w16a16_policy_m_32;
-      W16A16LauncherCallER(policy);
+      policy = 1;  // m_32
+    } else if (B_N <= 64) {
+      policy = 2;  // n_64
+    } else if (B_N <= 512) {
+      policy = 3;  // n_128
     } else {
-      if (B_N <= 64) {
-        using policy = w16a16_policy_n_64;
-        W16A16LauncherCallER(policy);
-      } else if (B_N <= 512) {
-        using policy = w16a16_policy_n_128;
-        W16A16LauncherCallER(policy);
-      } else {
-        using policy = w16a16_policy;
-        W16A16LauncherCallER(policy);
-      }
+      policy = 4;  // full tile
     }
-#undef W16A16LauncherCallER
   }
-#undef MoEGEMMLauncherCallER
+  a.group_size = group_size;
+  select_launcher(family, policy, a_bf16)(a);
   return ptr_D;
 }
+
 }  // namespace MoE
